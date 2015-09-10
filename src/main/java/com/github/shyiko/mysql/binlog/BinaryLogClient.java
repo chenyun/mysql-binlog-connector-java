@@ -20,22 +20,28 @@ import com.github.shyiko.mysql.binlog.event.EventData;
 import com.github.shyiko.mysql.binlog.event.EventHeader;
 import com.github.shyiko.mysql.binlog.event.EventHeaderV4;
 import com.github.shyiko.mysql.binlog.event.EventType;
+import com.github.shyiko.mysql.binlog.event.GtidEventData;
 import com.github.shyiko.mysql.binlog.event.RotateEventData;
 import com.github.shyiko.mysql.binlog.event.deserialization.ChecksumType;
 import com.github.shyiko.mysql.binlog.event.deserialization.EventDataDeserializationException;
 import com.github.shyiko.mysql.binlog.event.deserialization.EventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer;
+import com.github.shyiko.mysql.binlog.event.deserialization.GtidEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.RotateEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 import com.github.shyiko.mysql.binlog.jmx.BinaryLogClientMXBean;
 import com.github.shyiko.mysql.binlog.network.AuthenticationException;
+import com.github.shyiko.mysql.binlog.network.ServerException;
 import com.github.shyiko.mysql.binlog.network.SocketFactory;
 import com.github.shyiko.mysql.binlog.network.protocol.ErrorPacket;
 import com.github.shyiko.mysql.binlog.network.protocol.GreetingPacket;
+import com.github.shyiko.mysql.binlog.network.protocol.Packet;
 import com.github.shyiko.mysql.binlog.network.protocol.PacketChannel;
 import com.github.shyiko.mysql.binlog.network.protocol.ResultSetRowPacket;
 import com.github.shyiko.mysql.binlog.network.protocol.command.AuthenticateCommand;
+import com.github.shyiko.mysql.binlog.network.protocol.command.Command;
 import com.github.shyiko.mysql.binlog.network.protocol.command.DumpBinaryLogCommand;
+import com.github.shyiko.mysql.binlog.network.protocol.command.DumpBinaryLogGtidCommand;
 import com.github.shyiko.mysql.binlog.network.protocol.command.PingCommand;
 import com.github.shyiko.mysql.binlog.network.protocol.command.QueryCommand;
 
@@ -79,6 +85,10 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     private long serverId = 65535;
     private volatile String binlogFilename;
     private volatile long binlogPosition = 4;
+    private volatile long connectionId;
+
+    private GtidSet gtidSet;
+    private final Object gtidSetAccessLock = new Object();
 
     private EventDeserializer eventDeserializer = new EventDeserializer();
 
@@ -201,6 +211,41 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     }
 
     /**
+     * @return thread id
+     */
+    public long getConnectionId() {
+        return connectionId;
+    }
+
+    /**
+     * @return GTID set. Note that this value changes with each received GTID event (provided client is in GTID mode).
+     * @see #setGtidSet(String)
+     */
+    public String getGtidSet() {
+        synchronized (gtidSetAccessLock) {
+            return gtidSet != null ? gtidSet.toString() : null;
+        }
+    }
+
+    /**
+     * @param gtidSet GTID set (can be an empty string).
+     * <p>NOTE #1: Any value but null will switch BinaryLogClient into a GTID mode (in which case GTID set will be
+     * updated with each incoming GTID event) as well as set binlogFilename to "" (empty string) (meaning
+     * BinaryLogClient will request events "outside of the set" <u>starting from the oldest known binlog</u>).
+     * <p>NOTE #2: {@link #setBinlogFilename(String)} and {@link #setBinlogPosition(long)} can be used to specify the
+     * exact position from which MySQL server should start streaming events (taking into account GTID set).
+     * @see #getGtidSet()
+     */
+    public void setGtidSet(String gtidSet) {
+        if (gtidSet != null && this.binlogFilename == null) {
+            this.binlogFilename = "";
+        }
+        synchronized (gtidSetAccessLock) {
+            this.gtidSet = gtidSet != null ? new GtidSet(gtidSet) : null;
+        }
+    }
+
+    /**
      * @return true if "keep alive" thread should be automatically started (default), false otherwise.
      * @see #setKeepAlive(boolean)
      */
@@ -275,7 +320,8 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
 
     /**
      * Connect to the replication stream. Note that this method blocks until disconnected.
-     * @throws AuthenticationException in case of failed authentication
+     * @throws AuthenticationException if authentication fails
+     * @throws ServerException if MySQL server responds with an error
      * @throws IOException if anything goes wrong while trying to connect
      */
     public void connect() throws IOException {
@@ -283,19 +329,10 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
             throw new IllegalStateException("BinaryLogClient is already connected");
         }
         try {
-            try {
-                Socket socket = socketFactory != null ? socketFactory.createSocket() : new Socket();
-                socket.connect(new InetSocketAddress(hostname, port));
-                channel = new PacketChannel(socket);
-                if (channel.getInputStream().peek() == -1) {
-                    throw new EOFException();
-                }
-            } catch (IOException e) {
-                throw new IOException("Failed to connect to MySQL on " + hostname + ":" + port +
-                        ". Please make sure it's running.", e);
-            }
-            GreetingPacket greetingPacket = new GreetingPacket(channel.read());
+            establishConnection();
+            GreetingPacket greetingPacket = receiveGreeting();
             authenticate(greetingPacket.getScramble(), greetingPacket.getServerCollation());
+            connectionId = greetingPacket.getThreadId();
             if (binlogFilename == null) {
                 fetchBinlogFilenameAndPosition();
             }
@@ -309,7 +346,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
             if (checksumType != ChecksumType.NONE) {
                 confirmSupportOfChecksum(checksumType);
             }
-            channel.write(new DumpBinaryLogCommand(serverId, binlogFilename, binlogPosition));
+            requestBinaryLogStream();
         } catch (IOException e) {
             if (channel != null && channel.isOpen()) {
                 channel.close();
@@ -318,7 +355,8 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
         }
         connected = true;
         if (logger.isLoggable(Level.INFO)) {
-            logger.info("Connected to " + hostname + ":" + port + " at " + binlogFilename + "/" + binlogPosition);
+            logger.info("Connected to " + hostname + ":" + port + " at " + binlogFilename + "/" + binlogPosition +
+                " (sid:" + serverId + ", cid:" + connectionId + ")");
         }
         synchronized (lifecycleListeners) {
             for (LifecycleListener lifecycleListener : lifecycleListeners) {
@@ -328,14 +366,66 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
         if (keepAlive && !isKeepAliveThreadRunning()) {
             spawnKeepAliveThread();
         }
-        EventDataDeserializer eventDataDeserializer = eventDeserializer.getEventDataDeserializer(EventType.ROTATE);
-        if (eventDataDeserializer.getClass() != RotateEventDataDeserializer.class &&
-            eventDataDeserializer.getClass() != EventDeserializer.EventDataWrapper.Deserializer.class) {
-            eventDeserializer.setEventDataDeserializer(EventType.ROTATE,
-                new EventDeserializer.EventDataWrapper.Deserializer(new RotateEventDataDeserializer(),
-                    eventDataDeserializer));
+        ensureEventDataDeserializer(EventType.ROTATE, RotateEventDataDeserializer.class);
+        synchronized (gtidSetAccessLock) {
+            if (gtidSet != null) {
+                ensureEventDataDeserializer(EventType.GTID, GtidEventDataDeserializer.class);
+            }
         }
         listenForEventPackets();
+    }
+
+    private void establishConnection() throws IOException {
+        try {
+            Socket socket = socketFactory != null ? socketFactory.createSocket() : new Socket();
+            socket.connect(new InetSocketAddress(hostname, port));
+            channel = new PacketChannel(socket);
+            if (channel.getInputStream().peek() == -1) {
+                throw new EOFException();
+            }
+        } catch (IOException e) {
+            throw new IOException("Failed to connect to MySQL on " + hostname + ":" + port +
+                ". Please make sure it's running.", e);
+        }
+    }
+
+    private GreetingPacket receiveGreeting() throws IOException {
+        byte[] initialHandshakePacket = channel.read();
+        if (initialHandshakePacket[0] == ErrorPacket.HEADER) {
+            ErrorPacket errorPacket = new ErrorPacket(initialHandshakePacket, 1);
+            throw new ServerException(errorPacket.getErrorMessage(), errorPacket.getErrorCode(),
+                errorPacket.getSqlState());
+        }
+        return new GreetingPacket(initialHandshakePacket);
+    }
+
+    private void requestBinaryLogStream() throws IOException {
+        Command dumpBinaryLogCommand;
+        synchronized (gtidSetAccessLock) {
+            if (gtidSet != null) {
+                dumpBinaryLogCommand = new DumpBinaryLogGtidCommand(serverId, binlogFilename, binlogPosition, gtidSet);
+            } else {
+                dumpBinaryLogCommand = new DumpBinaryLogCommand(serverId, binlogFilename, binlogPosition);
+            }
+        }
+        channel.write(dumpBinaryLogCommand);
+    }
+
+    private void ensureEventDataDeserializer(EventType eventType,
+             Class<? extends EventDataDeserializer> eventDataDeserializerClass) {
+        EventDataDeserializer eventDataDeserializer = eventDeserializer.getEventDataDeserializer(eventType);
+        if (eventDataDeserializer.getClass() != eventDataDeserializerClass &&
+            eventDataDeserializer.getClass() != EventDeserializer.EventDataWrapper.Deserializer.class) {
+            EventDataDeserializer internalEventDataDeserializer;
+            try {
+                internalEventDataDeserializer = eventDataDeserializerClass.newInstance();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            eventDeserializer.setEventDataDeserializer(eventType,
+                new EventDeserializer.EventDataWrapper.Deserializer(internalEventDataDeserializer,
+                    eventDataDeserializer));
+        }
     }
 
     private void authenticate(String salt, int collation) throws IOException {
@@ -343,12 +433,10 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
         authenticateCommand.setCollation(collation);
         channel.write(authenticateCommand);
         byte[] authenticationResult = channel.read();
-        if (authenticationResult[0] != (byte) 0x00 /* ok */) {
-            if (authenticationResult[0] == (byte) 0xFF /* error */) {
-                byte[] bytes = Arrays.copyOfRange(authenticationResult, 1, authenticationResult.length);
-                throw new AuthenticationException(new ErrorPacket(bytes).getErrorMessage());
-            }
-            throw new AuthenticationException("Unexpected authentication result (" + authenticationResult[0] + ")");
+        if (authenticationResult[0] == ErrorPacket.HEADER) {
+            ErrorPacket errorPacket = new ErrorPacket(authenticationResult, 1);
+            throw new AuthenticationException(errorPacket.getErrorMessage(), errorPacket.getErrorCode(),
+                errorPacket.getSqlState());
         }
     }
 
@@ -413,9 +501,10 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     /**
      * Connect to the replication stream in a separate thread.
      * @param timeoutInMilliseconds timeout in milliseconds
-     * @throws AuthenticationException in case of failed authentication
+     * @throws AuthenticationException if authentication fails
+     * @throws ServerException if MySQL server responds with an error
      * @throws IOException if anything goes wrong while trying to connect
-     * @throws TimeoutException if client wasn't able to connect in the requested period of time
+     * @throws TimeoutException if client was unable to connect within given time limit
      */
     public void connect(long timeoutInMilliseconds) throws IOException, TimeoutException {
         final CountDownLatch countDownLatch = new CountDownLatch(1);
@@ -488,9 +577,10 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     private void confirmSupportOfChecksum(ChecksumType checksumType) throws IOException {
         channel.write(new QueryCommand("set @master_binlog_checksum= @@global.binlog_checksum"));
         byte[] statementResult = channel.read();
-        if (statementResult[0] == (byte) 0xFF /* error */) {
-            byte[] bytes = Arrays.copyOfRange(statementResult, 1, statementResult.length);
-            throw new IOException(new ErrorPacket(bytes).getErrorMessage());
+        if (statementResult[0] == ErrorPacket.HEADER) {
+            ErrorPacket errorPacket = new ErrorPacket(statementResult, 1);
+            throw new ServerException(errorPacket.getErrorMessage(), errorPacket.getErrorCode(),
+                    errorPacket.getSqlState());
         }
         eventDeserializer.setChecksumType(checksumType);
     }
@@ -502,13 +592,16 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                 int packetLength = inputStream.readInteger(3);
                 inputStream.skip(1); // 1 byte for sequence
                 int marker = inputStream.read();
-                if (marker == 0xFF) {
+                if (marker == ErrorPacket.HEADER) {
                     ErrorPacket errorPacket = new ErrorPacket(inputStream.read(packetLength - 1));
-                    throw new IOException(errorPacket.getErrorCode() + " - " + errorPacket.getErrorMessage());
+                    throw new ServerException(errorPacket.getErrorMessage(), errorPacket.getErrorCode(),
+                        errorPacket.getSqlState());
                 }
                 Event event;
                 try {
-                    event = eventDeserializer.nextEvent(inputStream);
+                    event = eventDeserializer.nextEvent(packetLength == Packet.MAX_LENGTH ?
+                        new ByteArrayInputStream(readPacketSplitInChunks(inputStream, packetLength - 1)) :
+                        inputStream);
                 } catch (Exception e) {
                     Throwable cause = e instanceof EventDataDeserializationException ? e.getCause() : e;
                     if (cause instanceof EOFException || cause instanceof SocketException) {
@@ -526,6 +619,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                 if (isConnected()) {
                     notifyEventListeners(event);
                     updateClientBinlogFilenameAndPosition(event);
+                    updateGtidSet(event);
                 }
             }
         } catch (Exception e) {
@@ -543,9 +637,22 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
         }
     }
 
+    private byte[] readPacketSplitInChunks(ByteArrayInputStream inputStream, int packetLength) throws IOException {
+        byte[] result = inputStream.read(packetLength);
+        int chunkLength;
+        do {
+            chunkLength = inputStream.readInteger(3);
+            inputStream.skip(1); // 1 byte for sequence
+            result = Arrays.copyOf(result, result.length + chunkLength);
+            inputStream.fill(result, result.length - chunkLength, chunkLength);
+        } while (chunkLength == Packet.MAX_LENGTH);
+        return result;
+    }
+
     private void updateClientBinlogFilenameAndPosition(Event event) {
         EventHeader eventHeader = event.getHeader();
-        if (eventHeader.getEventType() == EventType.ROTATE) {
+        EventType eventType = eventHeader.getEventType();
+        if (eventType == EventType.ROTATE) {
             EventData eventData = event.getData();
             RotateEventData rotateEventData;
             if (eventData instanceof EventDeserializer.EventDataWrapper) {
@@ -556,7 +663,9 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
             binlogFilename = rotateEventData.getBinlogFilename();
             binlogPosition = rotateEventData.getBinlogPosition();
         } else
-        if (eventHeader instanceof EventHeaderV4) {
+        // do not update binlogPosition on TABLE_MAP so that in case of reconnect (using a different instance of
+        // client) table mapping cache could be reconstructed before hitting row mutation event
+        if (eventType != EventType.TABLE_MAP && eventHeader instanceof EventHeaderV4) {
             EventHeaderV4 trackableEventHeader = (EventHeaderV4) eventHeader;
             long nextBinlogPosition = trackableEventHeader.getNextPosition();
             if (nextBinlogPosition > 0) {
@@ -565,10 +674,34 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
         }
     }
 
+    private void updateGtidSet(Event event) {
+        EventHeader eventHeader = event.getHeader();
+        if (eventHeader.getEventType() == EventType.GTID) {
+            synchronized (gtidSetAccessLock) {
+                if (gtidSet != null) {
+                    EventData eventData = event.getData();
+                    GtidEventData gtidEventData;
+                    if (eventData instanceof EventDeserializer.EventDataWrapper) {
+                        gtidEventData = (GtidEventData) ((EventDeserializer.EventDataWrapper) eventData).getInternal();
+                    } else {
+                        gtidEventData = (GtidEventData) eventData;
+                    }
+                    gtidSet.add(gtidEventData.getGtid());
+                }
+            }
+        }
+    }
+
     private ResultSetRowPacket[] readResultSet() throws IOException {
         List<ResultSetRowPacket> resultSet = new LinkedList<ResultSetRowPacket>();
-        while ((channel.read())[0] != (byte) 0xFE /* eof */) { /* skip */ }
-        for (byte[] bytes; (bytes = channel.read())[0] != (byte) 0xFE /* eof */; ) {
+        byte[] statementResult = channel.read();
+        if (statementResult[0] == ErrorPacket.HEADER) {
+            ErrorPacket errorPacket = new ErrorPacket(statementResult, 1);
+            throw new ServerException(errorPacket.getErrorMessage(), errorPacket.getErrorCode(),
+                    errorPacket.getSqlState());
+        }
+        while ((channel.read())[0] != (byte) 0xFE) { /* skip */ }
+        for (byte[] bytes; (bytes = channel.read())[0] != (byte) 0xFE;) {
             resultSet.add(new ResultSetRowPacket(bytes));
         }
         return resultSet.toArray(new ResultSetRowPacket[resultSet.size()]);

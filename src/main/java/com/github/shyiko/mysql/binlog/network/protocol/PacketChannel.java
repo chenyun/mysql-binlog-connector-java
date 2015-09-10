@@ -75,6 +75,16 @@ public class PacketChannel implements Channel {
 
     @Override
     public void close() throws IOException {
+        try {
+            socket.shutdownInput(); // for socketInputStream.setEOF(true)
+        } catch (Exception e) {
+            // ignore
+        }
+        try {
+            socket.shutdownOutput();
+        } catch (Exception e) {
+            // ignore
+        }
         socket.close();
     }
 }

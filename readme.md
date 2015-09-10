@@ -21,7 +21,7 @@ Get the latest JAR(s) from [here](http://search.maven.org/#search%7Cga%7C1%7Cg%3
 <dependency>
     <groupId>com.github.shyiko</groupId>
     <artifactId>mysql-binlog-connector-java</artifactId>
-    <version>0.1.3</version>
+    <version>0.2.2</version>
 </dependency>
 ```
 
@@ -32,7 +32,7 @@ The latest development version always available through Sonatype Snapshots repos
     <dependency>
         <groupId>com.github.shyiko</groupId>
         <artifactId>mysql-binlog-connector-java</artifactId>
-        <version>0.1.4-SNAPSHOT</version>
+        <version>0.2.3-SNAPSHOT</version>
     </dependency>
 </dependencies>
 
@@ -81,7 +81,10 @@ client.connect();
 ```
 
 > By default, BinaryLogClient starts from the current (at the time of connect) master binlog position. If you wish to
-kick off from a specific filename or position, use client.setBinlogFilename(...) + client.setBinlogPosition(...).
+kick off from a specific filename or position, use `client.setBinlogFilename(filename)` + `client.setBinlogPosition(position)`.
+
+> `client.connect()` is blocking (meaning that client will listen for events in the current thread). 
+`client.connect(timeout)`, on the other hand, spawns a separate thread.  
 
 ### Controlling event deserialization
 
@@ -146,8 +149,9 @@ mvn # shows how to build, test, etc. project
 
 ## Used by
 
-* [rook](https://github.com/shyiko/rook) - Change Data Capture (CDC) toolkit for keeping system layers in sync with the database.
-* [mydit](https://github.com/ngocdaothanh/mydit) - MySQL to MongoDB Replicator.
+* [shyiko/rook](https://github.com/shyiko/rook) - Change Data Capture (CDC) toolkit for keeping system layers in sync with the database.
+* [ngocdaothanh/mydit](https://github.com/ngocdaothanh/mydit) - MySQL to MongoDB data replicator.
+* [mardambey/mypipe](https://github.com/mardambey/mypipe) - MySQL binary log consumer with the ability to act on changed rows and publish changes to different systems with emphasis on Apache Kafka.
 
 ## Contributing
 
